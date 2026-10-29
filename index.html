@@ -122,6 +122,11 @@ button:disabled{opacity:.5;cursor:default}
 }
 @media (max-height:700px) and (max-width:899px){ #pad small{display:none} #pad button{padding:7px 0} #odds{display:none} }
 @media (prefers-reduced-motion:reduce){ .scope::after,#banner h1{animation:none} }
+#walletbar{margin-bottom:8px}
+#walletbar .btn2{margin-bottom:5px}
+#netnote{font-size:11px;line-height:1.35;color:var(--dim);text-align:center}
+#netnote.ok{color:var(--good)}
+#claim{margin-top:8px}
 </style>
 
 <div id="app">
@@ -175,11 +180,13 @@ button:disabled{opacity:.5;cursor:default}
       </div>
 
       <div class="sect on" id="play">
+        <div id="walletbar"><button class="btn2" id="wallet">CONNECT STARKEY WALLET</button><div id="netnote">Preview mode: simulated chain, no real tokens.</div></div>
         <div id="pad" role="group" aria-label="Pick a number"></div>
         <div class="chips" id="chips" role="group" aria-label="Bet size in $HOT"></div>
         <div id="odds"></div>
         <div id="badge" class="no"></div>
         <button id="roll" disabled>PICK A NUMBER</button>
+        <button class="btn2" id="claim" style="display:none">CLAIM</button>
         <div id="status" aria-live="polite"></div>
         <div class="demo" id="demo"><span>PREVIEW THE CAT</span>
           <button data-fx="win">Win</button><button data-fx="half">Half back</button><button data-fx="big">Big win</button><button data-fx="jackpot">Jackpot</button><button data-fx="lose">Lose</button><button data-fx="other">Someone else hits</button>
@@ -221,6 +228,95 @@ const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 const lerp = (a, b, k) => a + (b - a) * k;
 const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
 const LOSS = ["Nine lives, zero wins", "The cat is judging you", "Paws for thought", "Fur real? Try again", "Not today, whiskers"];
+
+
+/* ---------- Supra testnet + StarKey wallet (live mode) ---------- */
+// Live mode turns on when a wallet is connected AND the contract address below is set.
+// You can also pass it in the page address instead of editing this file: ?module=0xYOUR_WALLET
+const NET = {
+  RPC: "https://rpc-testnet.supra.com", CHAIN_ID: 6, NAME: "Supra testnet",
+  MODULE: "",      // the wallet address you published the contract from, e.g. "0xabc123..."
+  DECIMALS: 8,     // decimals of the $HOT (or test token) you passed to initialize
+};
+{ const q = new URLSearchParams(location.search).get("module"); if (q && /^0x[0-9a-fA-F]{1,64}$/.test(q)) NET.MODULE = q; }
+const LIVE = { on: false, addr: null, provider: null, claimable: 0, cashbackBps: 50, busyTx: false };
+const hasModule = () => /^0x[0-9a-fA-F]{1,64}$/.test(NET.MODULE);
+const FN = (n) => `${NET.MODULE}::cat_casino::${n}`;
+const u8b = (n) => Uint8Array.of(n);
+const u64b = (n) => { let v = BigInt(n); const b = new Uint8Array(8); for (let i = 0; i < 8; i++) { b[i] = Number(v & 0xffn); v >>= 8n; } return b; }; // BCS u64 = 8 bytes, little-endian
+const toUnits = (hotAmt) => BigInt(Math.round(hotAmt)) * 10n ** BigInt(NET.DECIMALS);
+const fromUnits = (u) => Number(BigInt(u)) / 10 ** NET.DECIMALS;
+async function rpc(path, body) {
+  const r = await fetch(NET.RPC + path, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : undefined);
+  if (!r.ok) throw new Error("Network error " + r.status);
+  return r.json();
+}
+async function view(fn, args = []) { const j = await rpc("/rpc/v1/view", { function: FN(fn), type_arguments: [], arguments: args }); return j.result; }
+async function playerInfo() {
+  const r = await view("player_info", [LIVE.addr]); // (tickets, completed, qualified, to next ticket, claimable, entries)
+  return { tickets: +r[0], completed: +r[1], qualified: +r[2], toNext: +r[3], claimable: fromUnits(r[4]), entries: +r[5] };
+}
+async function sendTx(fn, args) {
+  const p = LIVE.provider;
+  const acct = await rpc("/rpc/v1/accounts/" + LIVE.addr);
+  const payload = [LIVE.addr, parseInt(acct.sequence_number, 10), NET.MODULE, "cat_casino", fn, [], args];
+  const data = await p.createRawTransactionData(payload);
+  const res = await p.sendTransaction({ data, from: LIVE.addr, to: NET.MODULE, chainId: String(NET.CHAIN_ID), value: "" });
+  return typeof res === "string" ? res : (res && (res.hash || res.txHash)) || "";
+}
+async function refreshLive() {
+  if (!LIVE.on) return;
+  try {
+    const [jp, lot, players, next] = await view("radar");
+    S.jackpot = fromUnits(jp); S.lottery = fromUnits(lot); S.players = +players; S.nextDraw = +next;
+    const me = await playerInfo();
+    S.tickets = me.tickets; S.qual = me.qualified; S.entries = me.entries; LIVE.claimable = me.claimable;
+    try { const rl = await view("rules"); CFG.QUALIFY = fromUnits(rl[0]); LIVE.cashbackBps = +rl[4]; } catch (e) {}
+    S.winners = []; // the winners list reads from the chain in a later version
+  } catch (e) { setNote("Connected, but couldn't read the contract yet. Check the address.", false); return; }
+  renderHud(); renderControls();
+}
+function setNote(t, ok) { const n = $("#netnote"); n.textContent = t; n.className = ok ? "ok" : ""; }
+function renderWallet() {
+  const b = $("#wallet"), c = $("#claim");
+  if (!LIVE.addr) { b.textContent = "CONNECT STARKEY WALLET"; c.style.display = "none"; return; }
+  b.textContent = "CONNECTED " + short(LIVE.addr) + " · TAP TO DISCONNECT";
+  c.style.display = LIVE.on && LIVE.claimable > 0 ? "" : "none";
+  c.textContent = `CLAIM ${fmt(LIVE.claimable)} $HOT`;
+}
+async function connectWallet() {
+  if (LIVE.addr) { try { await LIVE.provider.disconnect(); } catch (e) {} LIVE.addr = null; LIVE.on = false; S.me = "0xDEMO"; setNote("Preview mode: simulated chain, no real tokens.", false); renderWallet(); renderControls(); renderHud(); return; }
+  const p = window.starkey && window.starkey.supra;
+  if (!p) { toast("StarKey wallet not found. Install the StarKey extension, or open this page in the StarKey app browser.", 6000); return; }
+  try {
+    const accts = await p.connect(); LIVE.provider = p; LIVE.addr = Array.isArray(accts) ? accts[0] : accts;
+    if (!LIVE.addr && p.account) { const a = await p.account(); LIVE.addr = Array.isArray(a) ? a[0] : (a && a.address) || a; }
+    try { const c = await p.getChainId(); const id = +(c && c.chainId !== undefined ? c.chainId : c); if (id !== NET.CHAIN_ID) await p.changeNetwork({ chainId: String(NET.CHAIN_ID) }); } catch (e) { toast("Switch StarKey to " + NET.NAME + " (chain " + NET.CHAIN_ID + ")", 5000); }
+    S.me = LIVE.addr;
+    if (hasModule()) { LIVE.on = true; setNote(NET.NAME + " · live bets with test tokens", true); await refreshLive(); }
+    else setNote("Wallet connected. Bets are still simulated: add ?module=0xYOUR_CONTRACT_WALLET to the page address (or set NET.MODULE) to go live.", false);
+    renderWallet(); renderControls(); renderHud();
+  } catch (e) { LIVE.addr = null; LIVE.on = false; toast((e && e.message) || "Wallet connection cancelled"); renderWallet(); }
+}
+async function liveBet(lucky, stakeHot, stage) {
+  stage("confirming");
+  const before = await playerInfo();
+  await sendTx("place_bet", [u8b(lucky), u64b(toUnits(stakeHot))]);
+  stage("vrf");
+  for (let i = 0; i < 72; i++) { // up to ~3 minutes
+    await sleep(2500);
+    let now; try { now = await playerInfo(); } catch (e) { continue; }
+    if (now.completed > before.completed) {
+      const cashback = Math.floor(stakeHot * LIVE.cashbackBps / 10000);
+      const payout = Math.max(0, Math.round(now.claimable - before.claimable - cashback));
+      const ratio = payout / stakeHot; let winning = 1, bd = Infinity;
+      MULT.forEach((m, k) => { const d = Math.abs(m - ratio); if (d < bd) { bd = d; winning = k + 1; } });
+      LIVE.claimable = now.claimable; S.tickets = now.tickets; S.qual = now.qualified;
+      return { pick: lucky, winning, mult: MULT[winning - 1], won: payout > stakeHot, stake: stakeHot, payout, cashback, jackpotHit: false, jpAmt: 0, ticket: now.tickets > before.tickets, qualified: stakeHot >= CFG.QUALIFY };
+    }
+  }
+  throw new Error("Still waiting for Supra randomness. Your bet is safe: check back soon, or recover it after 1 hour.");
+}
 
 /* ---------- demo chain (stand-in for the Supra dVRF contract) ---------- */
 const S = {
@@ -504,11 +600,11 @@ function renderControls() {
   $("#odds").innerHTML = pick === null ? "Pick your lucky number. The wheel decides where the ball lands." : `Lucky #${pick} · this slot pays <b>${fmtX(MULT[pick - 1])}</b> and lands ${pct(pick)} of rounds`;
   badge.className = q ? "ok" : "no";
   badge.textContent = q ? "Qualified: this bet rolls for the Jackpot and earns Lottery tickets." : `Below ${fmt(CFG.QUALIFY)} $HOT: you still get the wheel and 0.5% cashback, but no Jackpot roll and no Lottery tickets.`;
-  const roll = $("#roll"); roll.disabled = busy || pick === null || stake > S.balance;
-  roll.textContent = busy ? "THE CAT IS THINKING…" : pick === null ? "PICK YOUR LUCKY NUMBER" : stake > S.balance ? "NOT ENOUGH $HOT" : `ROLL · ${fmt(stake)} $HOT`;
+  const roll = $("#roll"); const broke = !LIVE.on && stake > S.balance; roll.disabled = busy || pick === null || broke;
+  roll.textContent = busy ? "THE CAT IS THINKING…" : pick === null ? "PICK YOUR LUCKY NUMBER" : broke ? "NOT ENOUGH $HOT" : `ROLL · ${fmt(stake)} $HOT`;
 }
 function renderHud() {
-  $("#bal").innerHTML = `${fmt(S.balance)}<i>$HOT</i>`;
+  $("#bal").innerHTML = LIVE.on ? `Claimable ${fmt(LIVE.claimable)}<i>$HOT</i>` : `${fmt(S.balance)}<i>$HOT</i>`;
   $("#players").textContent = fmt(S.players); $("#pool").textContent = fmt(S.lottery) + " $HOT"; $("#lpool").textContent = fmt(S.lottery) + " $HOT";
   const w = $("#winners"); w.innerHTML = "";
   S.winners.slice(0, 4).forEach((x) => { const d = document.createElement("div"); d.className = "win"; d.innerHTML = `<span>${x.p === S.me ? "You" : short(x.p)}</span><b>${fmt(x.a)} $HOT</b>`; w.appendChild(d); });
@@ -540,8 +636,8 @@ async function roll() {
   if (busy || pick === null) return;
   busy = true; renderControls(); ringTarget = 3.2; setState("wait"); sfx.whoosh(); startTicks();
   try {
-    const res = await chainBet(pick, stake, (s) => ($("#status").textContent = s === "confirming" ? "Placing your bet…" : "Waiting for Supra randomness…"));
-    $("#status").textContent = ""; renderHud(); await present(res);
+    const res = await (LIVE.on ? liveBet : chainBet)(pick, stake, (s) => ($("#status").textContent = s === "confirming" ? "Placing your bet…" : "Waiting for Supra randomness…"));
+    $("#status").textContent = ""; renderHud(); await present(res); if (LIVE.on) { await refreshLive(); renderWallet(); }
   } catch (e) { stopTicks(); ringTarget = 0.18; setState("idle"); $("#status").textContent = ""; toast(e.message); }
   pick = null; busy = false; renderControls(); renderHud();
 }
@@ -568,12 +664,18 @@ document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () 
 $("#radar").addEventListener("click", () => $("#radar").classList.toggle("open"));
 $("#roll").addEventListener("click", roll);
 $("#mute").addEventListener("click", () => { muted = !muted; $("#mute").textContent = muted ? "Sound off" : "Sound on"; });
-$("#enter").addEventListener("click", () => { S.entries += S.tickets; toast(`${S.tickets} ticket${S.tickets > 1 ? "s" : ""} entered. Good luck.`); S.tickets = 0; renderHud(); });
+$("#enter").addEventListener("click", async () => {
+  if (LIVE.on) { try { const n = S.tickets; await sendTx("enter_lottery", [u64b(n)]); toast(`${n} ticket${n > 1 ? "s" : ""} sent. Good luck.`); setTimeout(refreshLive, 4000); } catch (e) { toast((e && e.message) || "Transaction cancelled"); } return; }
+  S.entries += S.tickets; toast(`${S.tickets} ticket${S.tickets > 1 ? "s" : ""} entered. Good luck.`); S.tickets = 0; renderHud();
+});
+$("#claim").addEventListener("click", async () => { try { await sendTx("claim", []); toast("Claim sent."); setTimeout(async () => { await refreshLive(); renderWallet(); }, 4000); } catch (e) { toast((e && e.message) || "Transaction cancelled"); } });
+$("#wallet").addEventListener("click", connectWallet);
 document.querySelectorAll("#demo button").forEach((b) => b.addEventListener("click", () => preview(b.dataset.fx)));
-setInterval(() => { S.players += Math.floor(Math.random() * 4); S.jackpot += Math.random() * 900; S.lottery += Math.random() * 300; renderHud(); }, 4000);
-setInterval(() => { if (!busy && Math.random() < 0.08) preview("other"); }, 25000);
+setInterval(() => { if (LIVE.on) return; S.players += Math.floor(Math.random() * 4); S.jackpot += Math.random() * 900; S.lottery += Math.random() * 300; renderHud(); }, 4000);
+setInterval(() => { refreshLive().then(renderWallet); }, 8000);
+setInterval(() => { if (!LIVE.on && !busy && Math.random() < 0.08) preview("other"); }, 25000);
 setInterval(countdown, 1000); countdown(); tickJackpot();
 requestAnimationFrame((n) => { last = n; frame(n); });
-setTimeout(() => toast("Preview mode: simulated chain. Tap a coin or number, then ROLL.", 5000), 700);
+setTimeout(() => toast("Preview mode: simulated chain. Tap CONNECT STARKEY WALLET to use Supra testnet.", 5000), 700);
 })();
 </script>
